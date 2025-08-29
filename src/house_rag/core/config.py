@@ -28,6 +28,12 @@ class Config:
     # 应用配置
     DEBUG: bool = os.getenv('DEBUG', 'False').lower() == 'true'
     
+    # 成本控制配置
+    MAX_LLM_CALLS_PER_HOUR: int = int(os.getenv('MAX_LLM_CALLS_PER_HOUR', '50'))  # 每小时LLM调用限制
+    LLM_SAMPLING_RATE: float = float(os.getenv('LLM_SAMPLING_RATE', '0.3'))  # 中等复杂查询的LLM使用率
+    ENABLE_INTENT_CACHE: bool = os.getenv('ENABLE_INTENT_CACHE', 'True').lower() == 'true'  # 是否启用意图缓存
+    COST_TRACKING: bool = os.getenv('COST_TRACKING', 'True').lower() == 'true'  # 是否启用成本追踪
+    
     @property
     def database_url(self) -> str:
         """构建数据库连接URL"""

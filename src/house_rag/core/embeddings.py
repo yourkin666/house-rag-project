@@ -27,6 +27,17 @@ class RAGService:
         self.vector_store = None
         self.rag_chain = None
         self._query_cache = {}  # 简单的查询缓存
+        
+        # 成本控制和统计
+        self._intent_cache = {}  # 意图分析缓存
+        self._llm_call_stats = {
+            'total_calls': 0,
+            'cache_hits': 0,
+            'keyword_fallbacks': 0,
+            'hourly_calls': 0,
+            'last_reset_time': None
+        }
+        
         self._initialize()
     
     def _initialize(self) -> None:
@@ -436,7 +447,334 @@ class RAGService:
         return final_k
     
     def _get_adaptive_retriever_config(self, question: str, dynamic_k: int) -> dict:
-        """根据查询类型返回最佳的检索器配置"""
+        """根据查询类型返回最佳的检索器配置（成本优化版）"""
+        
+        # 首先检查缓存
+        cache_key = f"intent_{hash(question)}"
+        if config.ENABLE_INTENT_CACHE and cache_key in self._intent_cache:
+            logger.debug(f"使用缓存的意图分析结果: {question[:30]}...")
+            self._llm_call_stats['cache_hits'] += 1
+            return self._build_strategy_from_intents(self._intent_cache[cache_key], dynamic_k)
+        
+        # 成本优化：混合策略 - 先判断是否需要LLM
+        if self._should_use_llm_analysis(question):
+            try:
+                # 只对复杂查询使用LLM
+                intents = self._classify_intent_with_llm(question)
+                logger.info(f"LLM意图分析 - 查询: {question[:30]}..., 结果: {intents}")
+                
+                # 更新统计
+                self._llm_call_stats['total_calls'] += 1
+                self._llm_call_stats['hourly_calls'] += 1
+                
+                # 缓存结果
+                if config.ENABLE_INTENT_CACHE:
+                    self._intent_cache[cache_key] = intents
+                
+                return self._build_strategy_from_intents(intents, dynamic_k)
+                
+            except Exception as e:
+                logger.warning(f"LLM意图分析失败，回退到关键词匹配: {e}")
+                return self._get_keyword_based_config(question, dynamic_k)
+        else:
+            # 简单查询直接使用关键词匹配，节省成本
+            logger.debug(f"简单查询使用关键词匹配: {question[:30]}...")
+            return self._get_keyword_based_config(question, dynamic_k)
+    
+    def _should_use_llm_analysis(self, question: str) -> bool:
+        """判断是否需要使用LLM进行意图分析（成本控制）"""
+        
+        # 检查并重置小时计数器
+        self._reset_hourly_counter_if_needed()
+        
+        # 成本控制：检查LLM调用频率限制
+        if self._llm_call_stats['hourly_calls'] >= config.MAX_LLM_CALLS_PER_HOUR:
+            logger.warning(f"LLM调用已达小时限制({config.MAX_LLM_CALLS_PER_HOUR})，使用关键词匹配")
+            self._llm_call_stats['keyword_fallbacks'] += 1
+            return False
+        
+        # 简单查询条件：直接用关键词匹配就足够
+        simple_conditions = [
+            len(question) < 15,  # 很短的查询
+            any(simple in question for simple in ['推荐', '有什么', '看看']),  # 纯探索性
+            bool(re.search(r'^\w+房$', question)),  # 如"学区房"、"二手房"
+        ]
+        
+        if any(simple_conditions):
+            logger.debug(f"简单查询，直接使用关键词: {question[:30]}...")
+            return False
+            
+        # 复杂查询条件：需要LLM深度理解
+        complex_conditions = [
+            '不要' in question or '别' in question,  # 包含否定词
+            len(re.findall(r'[，,]', question)) >= 2,  # 多个条件用逗号分隔
+            any(compound in question for compound in ['而且', '但是', '不过', '同时']),  # 复合逻辑
+            len([w for w in ['价格', '位置', '房型', '面积', '学区', '地铁'] if w in question]) >= 2,  # 多维度需求
+            '性价比' in question and any(special in question for special in ['学区', '地铁', '景观']),  # 明显的复合需求
+        ]
+        
+        # 如果满足复杂条件，使用LLM
+        if any(complex_conditions):
+            logger.debug(f"检测到复杂查询，使用LLM分析: {question[:50]}...")
+            return True
+            
+        # 中等复杂度查询：随机采样，平衡成本和效果
+        import random
+        use_llm = random.random() < config.LLM_SAMPLING_RATE
+        if use_llm:
+            logger.debug(f"中等复杂查询随机选择LLM分析(概率{config.LLM_SAMPLING_RATE}): {question[:50]}...")
+        
+        return use_llm
+    
+    def _reset_hourly_counter_if_needed(self):
+        """重置小时计数器（如果需要）"""
+        import datetime
+        
+        now = datetime.datetime.now()
+        last_reset = self._llm_call_stats.get('last_reset_time')
+        
+        if last_reset is None or (now - last_reset).seconds >= 3600:  # 超过1小时
+            self._llm_call_stats['hourly_calls'] = 0
+            self._llm_call_stats['last_reset_time'] = now
+            logger.info("重置LLM小时调用计数器")
+    
+    def get_cost_stats(self) -> dict:
+        """获取成本统计信息"""
+        stats = self._llm_call_stats.copy()
+        stats['cache_size'] = len(self._intent_cache)
+        stats['cache_hit_rate'] = (
+            stats['cache_hits'] / max(1, stats['total_calls']) * 100
+        )
+        return stats
+    
+    def log_cost_summary(self):
+        """记录成本使用摘要"""
+        stats = self.get_cost_stats()
+        logger.info(f"LLM使用统计 - 总调用: {stats['total_calls']}, "
+                   f"缓存命中率: {stats['cache_hit_rate']:.1f}%, "
+                   f"本小时调用: {stats['hourly_calls']}, "
+                   f"关键词回退: {stats['keyword_fallbacks']}")
+    
+    def _classify_intent_with_llm(self, question: str) -> dict:
+        """使用LLM进行智能意图分类"""
+        
+        prompt = f"""
+请作为一个专业的房地产咨询师，细致分析以下用户查询的真实意图。
+
+用户查询："{question}"
+
+请从以下维度进行深入分析（每个维度评分0-10，0=完全不相关，10=高度相关）：
+
+## 核心需求维度：
+1. **价格敏感度 (price_sensitive)**：
+   - 关键词：便宜、经济、实惠、性价比、划算、优惠、预算有限、省钱
+   - 考虑：用户是否明确关心成本控制和经济效益
+
+2. **高端需求 (luxury)**：
+   - 关键词：豪华、高端、别墅、顶级、奢华、精品、品质、尊贵、豪宅
+   - 考虑：用户是否追求品质和档次，对价格不敏感
+
+3. **位置明确度 (location_specific)**：
+   - 关键词：具体区域、路名、街道、地铁站、商圈、附近、周边
+   - 考虑：用户是否有明确的地理位置要求
+
+4. **特殊需求 (special_needs)**：
+   - 关键词：学区、地铁、停车、电梯、花园、景观、采光、朝向、交通
+   - 考虑：用户是否有特定功能或配套设施的要求
+
+5. **查询模糊度 (vague)**：
+   - 关键词：房子、住房、房源、推荐、看看、有什么、随便
+   - 考虑：用户需求是否宽泛、探索性的、缺乏明确方向
+
+## 特殊语义分析：
+6. **否定意图识别 (negations)**：
+   - 否定词：不要、别、不需要、不想要、除了...之外、不考虑
+   - 限制词：太...、过于...、过分...
+   - 例如："不要太偏远" → ["偏远位置"]，"不考虑老房子" → ["老旧房屋"]
+
+7. **复合意图 (compound)**：
+   - 判断是否同时包含2个或以上高优先级需求
+   - 例如："性价比高的学区房" = 价格敏感 + 特殊需求
+
+## 语境理解要点：
+- 注意同义词和近义词（如：豪宅=别墅，实惠=便宜）
+- 识别隐含意图（如："刚需"通常暗示价格敏感）
+- 分析语气和紧迫度
+- 考虑否定词对整体意图的影响
+
+请严格按照以下JSON格式输出分析结果：
+{{
+    "price_sensitive": 数值,
+    "luxury": 数值,
+    "location_specific": 数值,
+    "special_needs": 数值,
+    "vague": 数值,
+    "negations": ["具体的否定内容"],
+    "compound": true或false,
+    "primary_intent": "主导意图名称",
+    "confidence": 分析置信度(0.0-1.0),
+    "reasoning": "简短的分析理由"
+}}
+"""
+        
+        response = self.llm.invoke(prompt)
+        
+        # 解析LLM响应
+        try:
+            # 尝试提取JSON部分
+            import json
+            import re
+            
+            # 提取JSON内容
+            json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            else:
+                raise ValueError("无法从LLM响应中提取JSON")
+                
+        except Exception as e:
+            logger.error(f"解析LLM响应失败: {e}")
+            # 返回默认的中性分析结果
+            return {
+                "price_sensitive": 5,
+                "luxury": 5,
+                "location_specific": 5,
+                "special_needs": 5,
+                "vague": 5,
+                "negations": [],
+                "compound": False,
+                "primary_intent": "default",
+                "confidence": 0.3
+            }
+    
+    def _build_strategy_from_intents(self, intents: dict, dynamic_k: int) -> dict:
+        """根据意图分析结果构建检索策略（增强版）"""
+        
+        # 获取各维度得分
+        price_score = intents.get("price_sensitive", 0)
+        luxury_score = intents.get("luxury", 0)
+        location_score = intents.get("location_specific", 0)
+        special_score = intents.get("special_needs", 0)
+        vague_score = intents.get("vague", 0)
+        is_compound = intents.get("compound", False)
+        confidence = intents.get("confidence", 0.5)
+        negations = intents.get("negations", [])
+        
+        # 记录详细分析日志
+        logger.info(f"意图分析详情 - 价格敏感: {price_score}, 高端: {luxury_score}, "
+                   f"位置: {location_score}, 特殊需求: {special_score}, 模糊: {vague_score}")
+        if negations:
+            logger.info(f"检测到否定意图: {negations}")
+        
+        # 低置信度时使用保守策略
+        if confidence < 0.6:
+            return {
+                "search_type": "similarity_score_threshold",
+                "search_kwargs": {
+                    "k": dynamic_k + 1,  # 低置信度时适当增加结果
+                    "score_threshold": 0.65  # 稍微降低要求
+                }
+            }
+        
+        # 处理包含否定词的查询 - 需要更大的结果集来过滤
+        has_negations = len(negations) > 0
+        if has_negations:
+            logger.info("检测到否定意图，增加结果数量以便后续过滤")
+            k_adjustment = 3  # 有否定词时显著增加结果数
+        else:
+            k_adjustment = 0
+        
+        # 处理复合意图：识别同时存在的多种需求
+        high_scores = sum(1 for score in [price_score, luxury_score, location_score, special_score] 
+                         if score >= 7)
+        
+        # 特殊复合策略：价格敏感 + 特殊需求的组合
+        if price_score >= 7 and special_score >= 7:
+            logger.info("检测到价格敏感+特殊需求复合查询")
+            return {
+                "search_type": "similarity",
+                "search_kwargs": {"k": dynamic_k + 4 + k_adjustment},  # 需要大量选择来平衡价格和需求
+                "strategy_reason": "price_sensitive_with_special_needs"
+            }
+        
+        # 特殊复合策略：位置 + 高端需求的组合
+        if location_score >= 7 and luxury_score >= 7:
+            logger.info("检测到位置+高端需求复合查询")
+            return {
+                "search_type": "similarity_score_threshold",
+                "search_kwargs": {
+                    "k": dynamic_k + 1 + k_adjustment,
+                    "score_threshold": 0.75  # 高端+位置，要求较高精度
+                },
+                "strategy_reason": "location_luxury_compound"
+            }
+        
+        # 通用复合意图处理
+        if is_compound or high_scores >= 2:
+            logger.info(f"检测到复合查询，高分维度数量: {high_scores}")
+            return {
+                "search_type": "similarity",
+                "search_kwargs": {"k": dynamic_k + 3 + k_adjustment},  # 复合查询需要更多选择
+                "strategy_reason": "compound_intent"
+            }
+        
+        # 单一明确意图的处理 - 按优先级顺序
+        if luxury_score >= 8:
+            return {
+                "search_type": "similarity_score_threshold",
+                "search_kwargs": {
+                    "k": dynamic_k + k_adjustment,
+                    "score_threshold": 0.78  # 高端查询，高标准
+                },
+                "strategy_reason": "luxury_focused"
+            }
+        
+        if special_score >= 8:
+            return {
+                "search_type": "similarity_score_threshold",
+                "search_kwargs": {
+                    "k": dynamic_k + 1 + k_adjustment,
+                    "score_threshold": 0.74  # 特殊需求，较高精度
+                },
+                "strategy_reason": "special_needs_focused"
+            }
+        
+        if location_score >= 8:
+            return {
+                "search_type": "similarity_score_threshold",
+                "search_kwargs": {
+                    "k": dynamic_k + k_adjustment,
+                    "score_threshold": 0.68  # 位置查询，适中标准
+                },
+                "strategy_reason": "location_focused"
+            }
+        
+        if price_score >= 8:
+            return {
+                "search_type": "similarity",
+                "search_kwargs": {"k": dynamic_k + 3 + k_adjustment},  # 价格敏感，更多选择
+                "strategy_reason": "price_sensitive_focused"
+            }
+        
+        if vague_score >= 8:
+            return {
+                "search_type": "similarity",
+                "search_kwargs": {"k": dynamic_k + 4 + k_adjustment},  # 模糊查询，大量选择
+                "strategy_reason": "vague_exploration"
+            }
+        
+        # 平衡策略（中等得分或无明确主导意图）
+        return {
+            "search_type": "similarity_score_threshold",
+            "search_kwargs": {
+                "k": dynamic_k + k_adjustment,
+                "score_threshold": 0.70
+            },
+            "strategy_reason": "balanced_default"
+        }
+    
+    def _get_keyword_based_config(self, question: str, dynamic_k: int) -> dict:
+        """基于关键词的传统匹配方式（作为LLM的后备方案）"""
         
         # 价格敏感查询 - 用户关心性价比，需要更多选择
         price_sensitive_keywords = ['便宜', '经济', '实惠', '性价比', '划算', '优惠']
