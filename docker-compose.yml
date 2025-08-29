@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库服务
+  db:
+    # 使用带有 pgvector 扩展的官方镜像
+    image: pgvector/pgvector:pg16
+    container_name: house_rag_db
+    # 从 .env 文件加载环境变量来配置数据库
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    # 数据卷，用于持久化存储数据库数据，防止容器重启后数据丢失
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # 将容器的 5432 端口映射到主机的指定端口
+    ports:
+      - "${DB_PORT}:5432"
+    # 设置重启策略
+    restart: unless-stopped
+
+  # Python 应用服务
+  app:
+    # 使用当前目录下的 Dockerfile 进行构建
+    build: .
+    container_name: house_rag_app
+    # 确保 app 服务在 db 服务启动之后再启动
+    depends_on:
+      - db
+    # 将容器的 8000 端口映射到主机的 8000 端口
+    ports:
+      - "8000:8000"
+    # 将当前项目目录挂载到容器内，这样本地代码修改可以实时同步到容器
+    volumes:
+      - .:/usr/src/app
+    # 指定环境变量文件
+    env_file:
+      - .env
+    # 覆盖 .env 文件中的 DB_HOST 和 DB_PORT，确保应用容器使用正确的内部网络连接
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+    # 启动 FastAPI 服务而不是保持容器空闲
+    command: uvicorn src.house_rag.api.app:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+# 定义数据卷
+volumes:
+  postgres_data:

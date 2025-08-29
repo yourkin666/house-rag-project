@@ -1,0 +1,11 @@
+langchain
+langchain-google-genai
+langchain-community
+pandas
+python-dotenv
+tiktoken
+psycopg2-binary
+SQLAlchemy
+pgvector
+fastapi
+uvicorn[standard]
