@@ -7,8 +7,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import (
-    QuestionRequest, QuestionResponse, HealthResponse,
-    PropertyRequest, PropertyResponse, PropertyCountResponse
+    QuestionRequest, QuestionResponse,
+    PropertyRequest, PropertyResponse
 )
 from ..core.config import config
 from ..core.database import db_manager
@@ -52,40 +52,6 @@ async def startup_event():
     except Exception as e:
         logger.error(f"服务启动失败: {e}")
         raise
-
-
-@app.get("/")
-async def root():
-    """根路径，返回API信息"""
-    return {
-        "message": "房源 RAG 知识库 API",
-        "version": "2.0.0",
-        "docs": "/docs",
-        "status": "运行中"
-    }
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """健康检查接口"""
-    try:
-        # 测试数据库连接
-        db_connected = db_manager.test_connection()
-        
-        if db_connected:
-            return HealthResponse(
-                status="healthy",
-                message="服务运行正常，数据库连接正常"
-            )
-        else:
-            return HealthResponse(
-                status="unhealthy",
-                message="数据库连接异常"
-            )
-    except Exception as e:
-        logger.error(f"健康检查失败: {e}")
-        raise HTTPException(status_code=500, detail="健康检查失败")
-
 
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
@@ -163,46 +129,6 @@ async def add_property(request: PropertyRequest):
         logger.error(f"添加房源失败: {e}")
         raise HTTPException(status_code=500, detail=f"添加房源失败: {str(e)}")
 
-
-@app.get("/properties/count", response_model=PropertyCountResponse)
-async def get_properties_count():
-    """
-    获取房源数量统计接口
-    
-    返回总房源数、已向量化数量和待向量化数量
-    """
-    try:
-        total, vectorized, pending = db_manager.get_properties_count()
-        
-        return PropertyCountResponse(
-            total_properties=total,
-            vectorized_properties=vectorized,
-            pending_vectorization=pending
-        )
-        
-    except Exception as e:
-        logger.error(f"获取房源统计失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取统计失败: {str(e)}")
-
-
-@app.get("/properties/{property_id}")
-async def get_property(property_id: int):
-    """
-    获取指定房源详情接口
-    """
-    try:
-        property_data = db_manager.get_property_by_id(property_id)
-        
-        if not property_data:
-            raise HTTPException(status_code=404, detail="房源不存在")
-        
-        return property_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取房源详情失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取房源详情失败: {str(e)}")
 
 
 if __name__ == "__main__":

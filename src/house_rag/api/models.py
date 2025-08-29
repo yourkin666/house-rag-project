@@ -40,12 +40,6 @@ class QuestionResponse(BaseModel):
         }
 
 
-class HealthResponse(BaseModel):
-    """健康检查响应模型"""
-    status: str
-    message: str
-
-
 class PropertyRequest(BaseModel):
     """添加房源请求模型"""
     title: str = Field(..., description="房源标题", min_length=1, max_length=200)
@@ -78,21 +72,5 @@ class PropertyResponse(BaseModel):
                 "message": "房源已成功添加并完成向量化",
                 "property_id": 15,
                 "vector_generated": True
-            }
-        }
-
-
-class PropertyCountResponse(BaseModel):
-    """房源数量统计响应模型"""
-    total_properties: int
-    vectorized_properties: int
-    pending_vectorization: int
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "total_properties": 20,
-                "vectorized_properties": 18,
-                "pending_vectorization": 2
             }
         }
