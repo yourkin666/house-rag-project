@@ -63,8 +63,171 @@ class RAGService:
             logger.error(f"RAG服务初始化失败: {e}")
             raise
     
-    def _extract_search_parameters(self, question: str) -> Dict[str, Any]:
-        """从用户问题中提取搜索参数"""
+    def _assess_extraction_quality(self, params: Dict[str, Any], question: str) -> Dict[str, Any]:
+        """评估规则提取结果的质量，决定是否需要LLM后备处理"""
+        quality_score = 0
+        max_score = 5
+        extraction_info = {
+            'quality_score': 0,
+            'needs_llm_fallback': False,
+            'reasons': [],
+            'extracted_fields_count': 0
+        }
+        
+        # 统计成功提取的字段数量
+        extracted_fields = 0
+        if params['price_range'] is not None:
+            extracted_fields += 1
+            quality_score += 1
+        if params['location_keywords']:
+            extracted_fields += 1
+            quality_score += 1
+        if params['property_type'] is not None:
+            extracted_fields += 1
+            quality_score += 1
+        if params['area_preference'] is not None:
+            extracted_fields += 1
+            quality_score += 1
+        if params['special_requirements']:
+            extracted_fields += 1
+            quality_score += 1
+        
+        extraction_info['extracted_fields_count'] = extracted_fields
+        extraction_info['quality_score'] = quality_score
+        
+        # 决定是否需要LLM后备处理的逻辑
+        question_length = len(question)
+        
+        # 情况1: 完全没有提取到任何信息
+        if extracted_fields == 0:
+            extraction_info['needs_llm_fallback'] = True
+            extraction_info['reasons'].append("规则提取未找到任何参数")
+        
+        # 情况2: 问题很长但提取信息很少（可能包含复杂表达）
+        elif question_length > 30 and extracted_fields <= 1:
+            extraction_info['needs_llm_fallback'] = True
+            extraction_info['reasons'].append("复杂查询但规则提取信息不足")
+        
+        # 情况3: 包含一些复杂的语言模式，规则可能无法处理
+        complex_patterns = [
+            '要么', '或者', '不过', '但是', '除了', '另外',
+            '最好是', '希望', '比较', '相对', '大概', '差不多',
+            '如果', '假如', '倘若'
+        ]
+        if any(pattern in question for pattern in complex_patterns):
+            if extracted_fields <= 2:  # 复杂表达但信息提取少
+                extraction_info['needs_llm_fallback'] = True
+                extraction_info['reasons'].append("检测到复杂语言模式")
+        
+        # 情况4: 质量得分过低
+        if quality_score < 2 and question_length > 15:
+            extraction_info['needs_llm_fallback'] = True
+            extraction_info['reasons'].append("整体提取质量偏低")
+        
+        logger.info(f"规则提取质量评估: 得分{quality_score}/{max_score}, "
+                   f"提取字段{extracted_fields}个, 需要LLM后备: {extraction_info['needs_llm_fallback']}")
+        
+        return extraction_info
+
+    def _extract_parameters_with_llm(self, question: str) -> Dict[str, Any]:
+        """使用LLM进行结构化参数提取（后备方案）"""
+        try:
+            # 构建专门的提取指令
+            extraction_prompt = f"""
+你是一个专业的房产查询参数提取助手。请从用户的找房问题中提取出以下结构化信息，并严格按照JSON格式返回：
+
+用户问题："{question}"
+
+请提取以下信息（如果某项信息未提及或无法确定，请设为null）：
+
+1. price_range: 价格区间，格式为[最小值, 最大值]，单位万元。如果只说了上限，最小值设为0
+2. location_keywords: 地理位置关键词列表，提取所有提及的地名、区域等
+3. property_type: 房屋类型，可选值："公寓"、"住宅"、"别墅"、"洋房"，只能选一个
+4. area_preference: 面积偏好，提取数字，单位平方米
+5. special_requirements: 特殊需求列表，如学区、地铁、停车、电梯等
+
+请只返回JSON格式的结果，不要包含其他说明文字：
+```json
+{{
+  "price_range": null 或 [数字1, 数字2],
+  "location_keywords": [字符串列表],
+  "property_type": null 或 "类型字符串", 
+  "area_preference": null 或 数字,
+  "special_requirements": [字符串列表]
+}}
+```"""
+
+            # 调用LLM进行提取
+            response = self.llm.invoke(extraction_prompt)
+            response_text = response.content.strip()
+            
+            # 尝试从响应中提取JSON
+            import json
+            import re
+            
+            # 查找JSON块
+            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # 如果没有代码块，尝试直接解析整个响应
+                json_str = response_text
+            
+            # 解析JSON
+            extracted_params = json.loads(json_str)
+            
+            # 数据清洗和验证
+            cleaned_params = {
+                'price_range': None,
+                'location_keywords': [],
+                'property_type': None,
+                'area_preference': None,
+                'special_requirements': []
+            }
+            
+            # 处理价格范围
+            if extracted_params.get('price_range'):
+                price_range = extracted_params['price_range']
+                if isinstance(price_range, list) and len(price_range) == 2:
+                    cleaned_params['price_range'] = tuple(price_range)
+            
+            # 处理地理位置
+            if extracted_params.get('location_keywords'):
+                if isinstance(extracted_params['location_keywords'], list):
+                    cleaned_params['location_keywords'] = extracted_params['location_keywords']
+            
+            # 处理房屋类型
+            if extracted_params.get('property_type'):
+                valid_types = ['公寓', '住宅', '别墅', '洋房']
+                if extracted_params['property_type'] in valid_types:
+                    cleaned_params['property_type'] = extracted_params['property_type']
+            
+            # 处理面积偏好
+            if extracted_params.get('area_preference'):
+                if isinstance(extracted_params['area_preference'], (int, float)):
+                    cleaned_params['area_preference'] = int(extracted_params['area_preference'])
+            
+            # 处理特殊需求
+            if extracted_params.get('special_requirements'):
+                if isinstance(extracted_params['special_requirements'], list):
+                    cleaned_params['special_requirements'] = extracted_params['special_requirements']
+            
+            logger.info(f"LLM提取成功: {cleaned_params}")
+            return cleaned_params
+            
+        except Exception as e:
+            logger.error(f"LLM参数提取失败: {e}")
+            # 返回空参数作为降级方案
+            return {
+                'price_range': None,
+                'location_keywords': [],
+                'property_type': None,
+                'area_preference': None,
+                'special_requirements': []
+            }
+
+    def _extract_search_parameters_rule_based(self, question: str) -> Dict[str, Any]:
+        """基于规则的参数提取（原有逻辑）"""
         params = {
             'price_range': None,
             'location_keywords': [],
@@ -119,26 +282,158 @@ class RAGService:
                 params['special_requirements'].append(keyword)
         
         return params
+
+    def _extract_search_parameters(self, question: str) -> Dict[str, Any]:
+        """
+        混合模式参数提取：首先使用规则提取，必要时使用LLM后备
+        """
+        # 第一阶段：规则提取
+        rule_based_params = self._extract_search_parameters_rule_based(question)
+        
+        # 第二阶段：质量评估
+        quality_info = self._assess_extraction_quality(rule_based_params, question)
+        
+        # 第三阶段：决定是否需要LLM后备
+        if quality_info['needs_llm_fallback']:
+            logger.info(f"触发LLM后备提取，原因: {', '.join(quality_info['reasons'])}")
+            
+            # 使用LLM提取
+            llm_params = self._extract_parameters_with_llm(question)
+            
+            # 合并规则提取和LLM提取结果
+            merged_params = self._merge_extraction_results(rule_based_params, llm_params, question)
+            
+            # 添加提取元数据
+            merged_params['_extraction_metadata'] = {
+                'method': 'hybrid',
+                'rule_quality': quality_info,
+                'used_llm_fallback': True,
+                'fallback_reasons': quality_info['reasons']
+            }
+            
+            return merged_params
+        
+        else:
+            logger.info("规则提取质量良好，使用规则提取结果")
+            # 添加提取元数据
+            rule_based_params['_extraction_metadata'] = {
+                'method': 'rule_based_only',
+                'rule_quality': quality_info,
+                'used_llm_fallback': False
+            }
+            
+            return rule_based_params
+
+    def _merge_extraction_results(self, rule_params: Dict[str, Any], llm_params: Dict[str, Any], question: str) -> Dict[str, Any]:
+        """
+        智能合并规则提取和LLM提取的结果
+        策略：优先使用规则结果（更精确），LLM结果作为补充
+        """
+        merged = {
+            'price_range': None,
+            'location_keywords': [],
+            'property_type': None,
+            'area_preference': None,
+            'special_requirements': []
+        }
+        
+        # 价格范围：优先使用规则结果，因为规则对数字处理更准确
+        merged['price_range'] = rule_params['price_range'] or llm_params['price_range']
+        
+        # 地理位置：合并两个结果，去重
+        all_locations = set(rule_params['location_keywords'] + llm_params['location_keywords'])
+        merged['location_keywords'] = list(all_locations)
+        
+        # 房屋类型：优先使用规则结果
+        merged['property_type'] = rule_params['property_type'] or llm_params['property_type']
+        
+        # 面积偏好：优先使用规则结果
+        merged['area_preference'] = rule_params['area_preference'] or llm_params['area_preference']
+        
+        # 特殊需求：合并两个结果，去重
+        all_requirements = set(rule_params['special_requirements'] + llm_params['special_requirements'])
+        merged['special_requirements'] = list(all_requirements)
+        
+        logger.info(f"合并提取结果完成: 规则字段{self._count_extracted_fields(rule_params)}个, "
+                   f"LLM字段{self._count_extracted_fields(llm_params)}个, "
+                   f"最终字段{self._count_extracted_fields(merged)}个")
+        
+        return merged
+
+    def _count_extracted_fields(self, params: Dict[str, Any]) -> int:
+        """计算提取到的有效字段数量"""
+        count = 0
+        if params.get('price_range'):
+            count += 1
+        if params.get('location_keywords'):
+            count += 1
+        if params.get('property_type'):
+            count += 1
+        if params.get('area_preference'):
+            count += 1
+        if params.get('special_requirements'):
+            count += 1
+        return count
+
+    def _clean_params_for_processing(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """移除参数中的元数据，返回干净的处理参数"""
+        clean_params = {
+            'price_range': params.get('price_range'),
+            'location_keywords': params.get('location_keywords', []),
+            'property_type': params.get('property_type'),
+            'area_preference': params.get('area_preference'),
+            'special_requirements': params.get('special_requirements', [])
+        }
+        return clean_params
     
-    def _calculate_dynamic_k(self, question: str, base_k: int = 5) -> int:
-        """根据查询复杂度动态调整检索数量"""
-        # 基于查询长度和复杂度调整
-        query_length = len(question)
+    def _calculate_dynamic_k(self, search_params: Dict[str, Any], question: str, base_k: int = 5, max_k: int = 12, min_k: int = 4) -> int:
+        """
+        根据查询复杂度动态调整检索数量 (优化版)
+        主要依据提取出的结构化参数数量来评估复杂度，比单纯的字符串分析更准确
+        """
         complexity_score = 0
         
-        # 长查询获得更高复杂度分数
-        if query_length > 50:
+        # 1. 基于提取出的参数数量（最可靠的指标）
+        # 每个有效的搜索维度都增加复杂度
+        if search_params.get('price_range'):
+            complexity_score += 1
+        if search_params.get('location_keywords'):
+            complexity_score += len(search_params['location_keywords'])  # 多个地点增加更多复杂度
+        if search_params.get('property_type'):
+            complexity_score += 1
+        if search_params.get('area_preference'):
+            complexity_score += 1
+        # 特殊需求越多，复杂度越高
+        if search_params.get('special_requirements'):
+            complexity_score += len(search_params['special_requirements'])
+        
+        # 2. 基于问题中的逻辑连接词作为补充（处理复杂逻辑关系）
+        logical_keywords = ['并且', '同时', '或者', '要么', '另外', '而且', '以及']
+        logical_complexity = sum(1 for keyword in logical_keywords if keyword in question)
+        complexity_score += logical_complexity
+        
+        # 3. 基于问题长度作为微调（长问题通常包含更多细节）
+        query_length = len(question)
+        if query_length > 80:
             complexity_score += 2
-        elif query_length > 30:
+        elif query_length > 50:
+            complexity_score += 1
+            
+        # 4. 检测模糊查询（需要更多结果来满足用户期望）
+        vague_indicators = ['推荐', '有什么', '看看', '找找', '合适的']
+        if any(indicator in question for indicator in vague_indicators):
             complexity_score += 1
         
-        # 包含多个条件的查询
-        condition_keywords = ['并且', '同时', '还要', '最好', '也要', '或者', '要么']
-        complexity_score += sum(1 for keyword in condition_keywords if keyword in question)
+        # 动态调整k值，确保在合理范围内
+        adjusted_k = min(base_k + complexity_score, max_k)
+        final_k = max(adjusted_k, min_k)
         
-        # 动态调整k值
-        adjusted_k = min(base_k + complexity_score, 10)  # 最多10个结果
-        return max(adjusted_k, 3)  # 最少3个结果
+        # 记录复杂度分析日志，便于调试和优化
+        logger.debug(f"复杂度分析 - 参数维度: {self._count_extracted_fields(search_params)}, "
+                    f"逻辑词: {logical_complexity}, 长度: {query_length}, "
+                    f"最终复杂度: {complexity_score}, K值: {final_k}")
+        
+        return final_k
     
     def _get_adaptive_retriever_config(self, question: str, dynamic_k: int) -> dict:
         """根据查询类型返回最佳的检索器配置"""
@@ -235,7 +530,7 @@ class RAGService:
         # 创建RAG链
         self.rag_chain = (
             {"context": smart_retrieve, "question": RunnablePassthrough(), 
-             "query_analysis": lambda x: self._extract_search_parameters(x)}
+             "query_analysis": lambda x: self._clean_params_for_processing(self._extract_search_parameters(x))}
             | prompt_template
             | self.llm
             | StrOutputParser()
@@ -252,11 +547,18 @@ class RAGService:
                 return cached_result['formatted_context']
             
             # 2. 提取搜索参数
-            search_params = self._extract_search_parameters(question)
-            logger.info(f"提取的搜索参数: {search_params}")
+            raw_search_params = self._extract_search_parameters(question)
+            search_params = self._clean_params_for_processing(raw_search_params)
+            
+            # 记录提取信息（包含元数据）
+            if '_extraction_metadata' in raw_search_params:
+                metadata = raw_search_params['_extraction_metadata']
+                logger.info(f"参数提取方式: {metadata['method']}, 使用LLM后备: {metadata['used_llm_fallback']}")
+            
+            logger.info(f"清理后的搜索参数: {search_params}")
             
             # 3. 动态调整检索数量
-            dynamic_k = self._calculate_dynamic_k(question)
+            dynamic_k = self._calculate_dynamic_k(search_params, question)
             logger.info(f"动态K值: {dynamic_k}")
             
             # 4. 自适应检索策略 - 根据查询类型调整参数
@@ -462,9 +764,14 @@ class RAGService:
         返回: {'answer': str, 'retrieved_properties': List[Dict], 'query_analysis': Dict, 'search_quality': Dict}
         """
         try:
-            # 提取查询参数（用于分析）
-            search_params = self._extract_search_parameters(question)
+            # 提取查询参数（包含元数据用于分析）
+            raw_search_params = self._extract_search_parameters(question)
+            search_params = self._clean_params_for_processing(raw_search_params)
+            extraction_metadata = raw_search_params.get('_extraction_metadata', {})
+            
             logger.info(f"用户查询分析: {search_params}")
+            if extraction_metadata:
+                logger.info(f"参数提取详情: {extraction_metadata}")
             
             # 获取RAG回答
             answer = self.rag_chain.invoke(question)
@@ -473,10 +780,14 @@ class RAGService:
             cache_key = hash(question)
             if cache_key in self._query_cache:
                 cached_data = self._query_cache[cache_key]
-                search_params = cached_data['search_params']
+                # 注意：缓存中的search_params可能是旧格式，保持兼容
+                cached_search_params = cached_data.get('search_params', {})
+                if '_extraction_metadata' not in cached_search_params:
+                    # 如果缓存的是清理后的参数，直接使用
+                    search_params = cached_search_params
             
             # 重新检索以获取详细信息
-            dynamic_k = self._calculate_dynamic_k(question)
+            dynamic_k = self._calculate_dynamic_k(search_params, question)
             retriever = self.vector_store.as_retriever(
                 search_type="similarity_score_threshold",
                 search_kwargs={
