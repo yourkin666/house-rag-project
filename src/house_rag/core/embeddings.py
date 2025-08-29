@@ -18,6 +18,103 @@ from .database import db_manager
 logger = logging.getLogger(__name__)
 
 
+class HybridSearchResult:
+    """混合搜索结果类"""
+    
+    def __init__(self, property_id: int, vector_score: float = 0.0, fulltext_score: float = 0.0, 
+                 vector_rank: int = 0, fulltext_rank: int = 0, final_score: float = 0.0):
+        self.property_id = property_id
+        self.vector_score = vector_score
+        self.fulltext_score = fulltext_score
+        self.vector_rank = vector_rank
+        self.fulltext_rank = fulltext_rank
+        self.final_score = final_score
+        
+    def __repr__(self):
+        return (f"HybridSearchResult(id={self.property_id}, "
+                f"vector_score={self.vector_score:.3f}, "
+                f"fulltext_score={self.fulltext_score:.3f}, "
+                f"final_score={self.final_score:.3f})")
+
+
+class ReciprocalRankFusion:
+    """
+    Reciprocal Rank Fusion (RRF) 算法实现
+    
+    RRF是一种无监督的排名融合方法，特别适合结合不同搜索系统的结果。
+    它不需要预先知道各个搜索系统的准确性，能够自动平衡不同系统的贡献。
+    
+    公式: RRF_score(d) = Σ 1/(k + rank_i(d))
+    其中 d 是文档，rank_i(d) 是文档 d 在第 i 个排名列表中的位置，k 是平滑参数
+    """
+    
+    def __init__(self, k: int = 60):
+        """
+        初始化 RRF 融合器
+        
+        Args:
+            k: RRF 平滑参数，默认60。较大的k值会减少高排名和低排名之间的差异
+        """
+        self.k = k
+    
+    def fuse_rankings(self, vector_results: List[Tuple[int, float]], 
+                     fulltext_results: List[Tuple[int, float]], 
+                     max_results: int = 50) -> List[HybridSearchResult]:
+        """
+        使用 RRF 算法融合向量搜索和全文搜索的结果
+        
+        Args:
+            vector_results: 向量搜索结果 [(property_id, score), ...]
+            fulltext_results: 全文搜索结果 [(property_id, score), ...]
+            max_results: 返回的最大结果数
+            
+        Returns:
+            List[HybridSearchResult]: 融合后的排序结果
+        """
+        # 收集所有唯一的property_id
+        all_property_ids = set()
+        vector_dict = {}
+        fulltext_dict = {}
+        
+        # 处理向量搜索结果
+        for rank, (prop_id, score) in enumerate(vector_results, 1):
+            all_property_ids.add(prop_id)
+            vector_dict[prop_id] = {'score': score, 'rank': rank}
+        
+        # 处理全文搜索结果
+        for rank, (prop_id, score) in enumerate(fulltext_results, 1):
+            all_property_ids.add(prop_id)
+            fulltext_dict[prop_id] = {'score': score, 'rank': rank}
+        
+        # 计算融合分数
+        hybrid_results = []
+        for prop_id in all_property_ids:
+            vector_info = vector_dict.get(prop_id, {'score': 0.0, 'rank': len(vector_results) + 1})
+            fulltext_info = fulltext_dict.get(prop_id, {'score': 0.0, 'rank': len(fulltext_results) + 1})
+            
+            # RRF 分数计算
+            rrf_score = 0.0
+            if prop_id in vector_dict:
+                rrf_score += 1.0 / (self.k + vector_info['rank'])
+            if prop_id in fulltext_dict:
+                rrf_score += 1.0 / (self.k + fulltext_info['rank'])
+            
+            hybrid_result = HybridSearchResult(
+                property_id=prop_id,
+                vector_score=vector_info['score'],
+                fulltext_score=fulltext_info['score'],
+                vector_rank=vector_info['rank'],
+                fulltext_rank=fulltext_info['rank'],
+                final_score=rrf_score
+            )
+            hybrid_results.append(hybrid_result)
+        
+        # 按融合分数排序
+        hybrid_results.sort(key=lambda x: x.final_score, reverse=True)
+        
+        return hybrid_results[:max_results]
+
+
 class RAGService:
     """RAG服务类，处理向量化和问答"""
     
@@ -36,6 +133,15 @@ class RAGService:
             'keyword_fallbacks': 0,
             'hourly_calls': 0,
             'last_reset_time': None
+        }
+        
+        # 混合搜索相关组件
+        self.rrf_fusion = ReciprocalRankFusion(k=60)
+        self.hybrid_search_enabled = True  # 控制是否启用混合搜索
+        self.hybrid_search_stats = {
+            'total_hybrid_searches': 0,
+            'vector_only_fallbacks': 0,
+            'fulltext_contributions': 0
         }
         
         self._initialize()
@@ -874,6 +980,164 @@ class RAGService:
             | StrOutputParser()
         )
     
+    def _hybrid_search_and_rerank(self, question: str, search_params: Dict[str, Any], dynamic_k: int) -> List[Document]:
+        """
+        执行混合搜索：结合向量搜索和全文搜索，使用RRF算法融合结果
+        
+        Args:
+            question: 用户查询
+            search_params: 提取的搜索参数
+            dynamic_k: 动态检索数量
+            
+        Returns:
+            List[Document]: 融合重排序后的文档列表
+        """
+        try:
+            self.hybrid_search_stats['total_hybrid_searches'] += 1
+            
+            logger.info("开始执行混合搜索...")
+            
+            # 1. 执行向量搜索
+            vector_results = self._perform_vector_search(question, dynamic_k * 2)  # 增加召回量以提高融合效果
+            logger.info(f"向量搜索返回 {len(vector_results)} 个结果")
+            
+            # 2. 执行全文搜索
+            fulltext_results = db_manager.fulltext_search(question, limit=dynamic_k * 2)
+            logger.info(f"全文搜索返回 {len(fulltext_results)} 个结果")
+            
+            # 3. 使用RRF算法融合结果
+            if not fulltext_results:
+                # 如果全文搜索没有结果，回退到纯向量搜索
+                logger.info("全文搜索无结果，回退到纯向量搜索")
+                self.hybrid_search_stats['vector_only_fallbacks'] += 1
+                return self._convert_vector_results_to_docs(vector_results[:dynamic_k], search_params)
+            
+            if not vector_results:
+                # 如果向量搜索没有结果，使用全文搜索结果
+                logger.info("向量搜索无结果，使用全文搜索结果")
+                return self._convert_fulltext_results_to_docs(fulltext_results[:dynamic_k])
+            
+            # 执行RRF融合
+            hybrid_results = self.rrf_fusion.fuse_rankings(vector_results, fulltext_results, dynamic_k)
+            logger.info(f"RRF融合后得到 {len(hybrid_results)} 个结果")
+            
+            # 统计有全文搜索贡献的结果
+            fulltext_contributed = sum(1 for r in hybrid_results[:dynamic_k] if r.fulltext_score > 0)
+            self.hybrid_search_stats['fulltext_contributions'] += fulltext_contributed
+            
+            # 4. 转换为Document对象并应用重排序过滤
+            fused_docs = self._convert_hybrid_results_to_docs(hybrid_results[:dynamic_k])
+            filtered_docs = self._rerank_and_filter(fused_docs, search_params)
+            
+            logger.info(f"混合搜索最终返回 {len(filtered_docs)} 个文档")
+            return filtered_docs
+            
+        except Exception as e:
+            logger.error(f"混合搜索执行失败: {e}")
+            logger.info("回退到纯向量搜索")
+            self.hybrid_search_stats['vector_only_fallbacks'] += 1
+            
+            # 回退到传统向量搜索
+            retriever_config = self._get_adaptive_retriever_config(question, dynamic_k)
+            retriever = self.vector_store.as_retriever(**retriever_config)
+            retrieved_docs = retriever.invoke(question)
+            return self._rerank_and_filter(retrieved_docs, search_params)
+    
+    def _perform_vector_search(self, question: str, k: int) -> List[Tuple[int, float]]:
+        """
+        执行向量搜索，返回property_id和相似度分数的列表
+        """
+        try:
+            # 使用现有的向量存储进行搜索
+            retriever_config = self._get_adaptive_retriever_config(question, k)
+            retriever = self.vector_store.as_retriever(**retriever_config)
+            retrieved_docs = retriever.invoke(question)
+            
+            # 提取property_id和分数
+            results = []
+            for doc in retrieved_docs:
+                if 'property_id' in doc.metadata:
+                    # 这里使用一个简单的相似度评分，实际可以从检索器获取更精确的分数
+                    # 在实际实现中，可以考虑使用similarity_search_with_score方法
+                    results.append((doc.metadata['property_id'], 1.0 / (len(results) + 1)))
+            
+            return results
+        except Exception as e:
+            logger.error(f"向量搜索失败: {e}")
+            return []
+    
+    def _convert_vector_results_to_docs(self, vector_results: List[Tuple[int, float]], 
+                                       search_params: Dict[str, Any]) -> List[Document]:
+        """将向量搜索结果转换为Document对象"""
+        if not vector_results:
+            return []
+        
+        property_ids = [result[0] for result in vector_results]
+        properties = db_manager.get_properties_by_ids(property_ids)
+        
+        docs = []
+        for prop in properties:
+            doc_content = f"房源：{prop['title']}。位于 {prop['location']}，价格 {prop['price']}万元。{prop['description']}"
+            metadata = {
+                'property_id': prop['id'],
+                'title': prop['title'],
+                'location': prop['location'],
+                'price': prop['price']
+            }
+            docs.append(Document(page_content=doc_content, metadata=metadata))
+        
+        return docs
+    
+    def _convert_fulltext_results_to_docs(self, fulltext_results: List[Tuple[int, float]]) -> List[Document]:
+        """将全文搜索结果转换为Document对象"""
+        if not fulltext_results:
+            return []
+        
+        property_ids = [result[0] for result in fulltext_results]
+        properties = db_manager.get_properties_by_ids(property_ids)
+        
+        docs = []
+        for prop in properties:
+            doc_content = f"房源：{prop['title']}。位于 {prop['location']}，价格 {prop['price']}万元。{prop['description']}"
+            metadata = {
+                'property_id': prop['id'],
+                'title': prop['title'],
+                'location': prop['location'],
+                'price': prop['price']
+            }
+            docs.append(Document(page_content=doc_content, metadata=metadata))
+        
+        return docs
+    
+    def _convert_hybrid_results_to_docs(self, hybrid_results: List[HybridSearchResult]) -> List[Document]:
+        """将混合搜索结果转换为Document对象"""
+        if not hybrid_results:
+            return []
+        
+        property_ids = [result.property_id for result in hybrid_results]
+        properties = db_manager.get_properties_by_ids(property_ids)
+        
+        # 创建property_id到property信息的映射
+        prop_dict = {prop['id']: prop for prop in properties}
+        
+        docs = []
+        for hybrid_result in hybrid_results:
+            prop = prop_dict.get(hybrid_result.property_id)
+            if prop:
+                doc_content = f"房源：{prop['title']}。位于 {prop['location']}，价格 {prop['price']}万元。{prop['description']}"
+                metadata = {
+                    'property_id': prop['id'],
+                    'title': prop['title'],
+                    'location': prop['location'],
+                    'price': prop['price'],
+                    'hybrid_score': hybrid_result.final_score,
+                    'vector_score': hybrid_result.vector_score,
+                    'fulltext_score': hybrid_result.fulltext_score
+                }
+                docs.append(Document(page_content=doc_content, metadata=metadata))
+        
+        return docs
+
     def _smart_retrieval(self, question: str) -> str:
         """智能检索和结果处理"""
         try:
@@ -899,15 +1163,19 @@ class RAGService:
             dynamic_k = self._calculate_dynamic_k(search_params, question)
             logger.info(f"动态K值: {dynamic_k}")
             
-            # 4. 自适应检索策略 - 根据查询类型调整参数
-            retriever_config = self._get_adaptive_retriever_config(question, dynamic_k)
-            logger.info(f"检索策略: {retriever_config}")
-            
-            retriever = self.vector_store.as_retriever(**retriever_config)
-            retrieved_docs = retriever.invoke(question)
-            
-            # 5. 结果重排序和过滤
-            filtered_docs = self._rerank_and_filter(retrieved_docs, search_params)
+            # 4. 执行混合搜索（向量搜索 + 全文搜索）
+            if self.hybrid_search_enabled:
+                filtered_docs = self._hybrid_search_and_rerank(question, search_params, dynamic_k)
+            else:
+                # 回退到纯向量搜索
+                retriever_config = self._get_adaptive_retriever_config(question, dynamic_k)
+                logger.info(f"检索策略: {retriever_config}")
+                
+                retriever = self.vector_store.as_retriever(**retriever_config)
+                retrieved_docs = retriever.invoke(question)
+                
+                # 5. 结果重排序和过滤
+                filtered_docs = self._rerank_and_filter(retrieved_docs, search_params)
             
             # 6. 格式化结果
             formatted_context = self._format_docs_enhanced(filtered_docs, search_params)

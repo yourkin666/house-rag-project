@@ -167,6 +167,149 @@ class DatabaseManager:
         except SQLAlchemyError as e:
             logger.error(f"获取房源信息失败: {e}")
             raise
+    
+    def get_properties_by_ids(self, property_ids: List[int]) -> List[dict]:
+        """
+        根据ID列表批量获取房源信息
+        返回: 房源字典列表
+        """
+        if not property_ids:
+            return []
+            
+        try:
+            with self.engine.connect() as conn:
+                # 构建 IN 子句的参数
+                placeholders = ','.join([f':id_{i}' for i in range(len(property_ids))])
+                params = {f'id_{i}': property_ids[i] for i in range(len(property_ids))}
+                
+                results = conn.execute(
+                    text(f"""
+                        SELECT id, title, location, price, description, created_at, updated_at
+                        FROM properties 
+                        WHERE id IN ({placeholders})
+                        ORDER BY id
+                    """),
+                    params
+                ).fetchall()
+                
+                return [
+                    {
+                        'id': row[0],
+                        'title': row[1],
+                        'location': row[2],
+                        'price': float(row[3]) if row[3] else None,
+                        'description': row[4],
+                        'created_at': row[5],
+                        'updated_at': row[6]
+                    }
+                    for row in results
+                ]
+        except SQLAlchemyError as e:
+            logger.error(f"批量获取房源信息失败: {e}")
+            raise
+    
+    def fulltext_search(self, query: str, limit: int = 20, min_rank: float = 0.01) -> List[Tuple[int, float]]:
+        """
+        执行全文搜索
+        
+        Args:
+            query: 搜索查询字符串
+            limit: 返回结果数量限制
+            min_rank: 最小相关性分数阈值
+            
+        Returns:
+            List[Tuple[int, float]]: [(property_id, relevance_score), ...]
+        """
+        try:
+            with self.engine.connect() as conn:
+                # 清理查询字符串，移除特殊字符，用 & 连接多个词
+                cleaned_query = self._clean_fulltext_query(query)
+                if not cleaned_query:
+                    return []
+                
+                results = conn.execute(
+                    text("""
+                        SELECT 
+                            id,
+                            ts_rank(search_vector, to_tsquery('simple', :query)) as rank
+                        FROM properties 
+                        WHERE search_vector @@ to_tsquery('simple', :query)
+                        AND ts_rank(search_vector, to_tsquery('simple', :query)) >= :min_rank
+                        ORDER BY rank DESC, id ASC
+                        LIMIT :limit
+                    """),
+                    {
+                        'query': cleaned_query,
+                        'min_rank': min_rank,
+                        'limit': limit
+                    }
+                ).fetchall()
+                
+                return [(row[0], float(row[1])) for row in results]
+        except SQLAlchemyError as e:
+            logger.error(f"全文搜索失败: {e}")
+            # 如果全文搜索失败，返回空结果而不是抛出异常，确保混合搜索的鲁棒性
+            logger.warning("全文搜索失败，将只使用向量搜索")
+            return []
+    
+    def _clean_fulltext_query(self, query: str) -> str:
+        """
+        清理和预处理全文搜索查询字符串
+        
+        Args:
+            query: 原始查询字符串
+            
+        Returns:
+            str: 清理后的查询字符串，适用于 PostgreSQL 的 to_tsquery
+        """
+        if not query or not query.strip():
+            return ""
+        
+        # 移除特殊字符，只保留字母、数字、中文字符和空格
+        import re
+        cleaned = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', query)
+        
+        # 将多个空格替换为单个空格，并去除首尾空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        if not cleaned:
+            return ""
+        
+        # 将空格分隔的词用 & 连接（AND 操作）
+        words = cleaned.split()
+        if len(words) == 1:
+            # 单个词，添加前缀匹配支持
+            return f"{words[0]}:*"
+        else:
+            # 多个词，用 & 连接
+            return ' & '.join([f"{word}:*" for word in words])
+    
+    def rebuild_search_vectors(self) -> int:
+        """
+        重建所有房源的搜索向量
+        返回: 更新的记录数
+        """
+        try:
+            with self.engine.connect() as conn:
+                trans = conn.begin()
+                try:
+                    result = conn.execute(
+                        text("""
+                            UPDATE properties 
+                            SET search_vector = generate_search_vector(title, location, description)
+                            WHERE title IS NOT NULL OR location IS NOT NULL OR description IS NOT NULL
+                        """)
+                    )
+                    updated_count = result.rowcount
+                    trans.commit()
+                    logger.info(f"成功重建 {updated_count} 条房源的搜索向量")
+                    return updated_count
+                except Exception:
+                    trans.rollback()
+                    raise
+        except SQLAlchemyError as e:
+            logger.error(f"重建搜索向量失败: {e}")
+            raise
 
 
 # 全局数据库管理器实例
