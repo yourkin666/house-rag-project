@@ -1199,35 +1199,70 @@ class RAGService:
             return self._fallback_retrieval(question)
     
     def _rerank_and_filter(self, docs: List[Document], search_params: Dict[str, Any]) -> List[Document]:
-        """结果重排序和过滤"""
+        """结果重排序和过滤 - 优化版本，融合混合搜索分数"""
         if not docs:
             return docs
         
         scored_docs = []
         
         for doc in docs:
-            score = 1.0  # 基础分数
+            # 使用混合搜索的RRF分数作为基础分，如果没有则使用默认值
+            base_score = doc.metadata.get('hybrid_score', 0.5)  # 混合搜索分数作为基础
+            score = base_score  # 基础分数来自混合搜索
             metadata = doc.metadata
             
-            # 价格匹配加分
+            # 价格匹配加分 - 优化版本，使用连续评分函数
             if search_params.get('price_range') and metadata.get('price'):
                 try:
                     price = float(metadata['price'])
                     min_price, max_price = search_params['price_range']
+                    
                     if min_price <= price <= max_price:
-                        score += 0.3  # 价格完全匹配
-                    elif abs(price - max_price) / max_price < 0.2:  # 价格接近
-                        score += 0.1
+                        # 在预算范围内，根据接近度给分
+                        ideal_price = (min_price + max_price) / 2  # 理想价格为范围中点
+                        price_range_span = max_price - min_price
+                        if price_range_span > 0:
+                            # 越接近理想价格，分数越高
+                            proximity = 1 - abs(price - ideal_price) / (price_range_span / 2)
+                            score += 0.4 * proximity  # 最高0.4分
+                        else:
+                            score += 0.4  # 精确匹配
+                    else:
+                        # 超出预算，根据超出程度扣分
+                        if price > max_price:
+                            over_ratio = (price - max_price) / max_price
+                            if over_ratio < 0.1:  # 超出不到10%
+                                score += 0.2
+                            elif over_ratio < 0.2:  # 超出10-20%
+                                score += 0.1
+                            # 超出20%以上不加分
+                        elif price < min_price:
+                            # 价格过低，可能有其他问题
+                            under_ratio = (min_price - price) / min_price
+                            if under_ratio < 0.3:  # 低于预算30%内
+                                score += 0.15
                 except (ValueError, TypeError):
                     pass
             
-            # 位置匹配加分
+            # 位置匹配加分 - 优化版本，支持模糊匹配
             if search_params.get('location_keywords'):
                 location = metadata.get('location', '').lower()
+                location_bonus = 0
+                
                 for keyword in search_params['location_keywords']:
-                    if keyword.lower() in location:
-                        score += 0.2
-                        break
+                    keyword_lower = keyword.lower()
+                    
+                    # 精确匹配
+                    if keyword_lower in location:
+                        location_bonus = max(location_bonus, 0.3)  # 精确匹配最高分
+                    else:
+                        # 模糊匹配
+                        similarity = self._calculate_location_similarity(keyword_lower, location)
+                        if similarity > 0.7:  # 相似度阈值
+                            fuzzy_bonus = 0.2 * similarity  # 根据相似度给分
+                            location_bonus = max(location_bonus, fuzzy_bonus)
+                
+                score += location_bonus
             
             # 特殊需求匹配
             if search_params.get('special_requirements'):
@@ -1241,6 +1276,16 @@ class RAGService:
                 if search_params['property_type'].lower() in doc.page_content.lower():
                     score += 0.25
             
+            # 否定条件处理 - 新增功能
+            negative_keywords = self._extract_negative_keywords(search_params)
+            if negative_keywords:
+                content_lower = doc.page_content.lower()
+                for neg_keyword in negative_keywords:
+                    if neg_keyword.lower() in content_lower:
+                        score *= 0.3  # 严重扣分，而不是完全排除
+                        logger.info(f"房源包含否定关键词 '{neg_keyword}'，大幅降低评分")
+                        break  # 一旦匹配到否定条件，就停止检查其他否定条件
+            
             scored_docs.append((score, doc))
         
         # 按分数排序
@@ -1248,6 +1293,137 @@ class RAGService:
         
         # 返回前N个最佳匹配（最多8个）
         return [doc for score, doc in scored_docs[:8]]
+    
+    def _extract_negative_keywords(self, search_params: Dict[str, Any]) -> List[str]:
+        """
+        从搜索参数中提取否定关键词
+        识别用户不希望出现的特征
+        """
+        negative_keywords = []
+        
+        # 检查特殊需求中的否定表达
+        special_requirements = search_params.get('special_requirements', [])
+        negative_patterns = [
+            ('不要', ''), ('避免', ''), ('除了', ''), ('排除', ''),
+            ('远离', ''), ('不靠近', ''), ('不接受', ''), ('拒绝', ''),
+            ('没有', ''), ('无', ''), ('非', '')
+        ]
+        
+        for requirement in special_requirements:
+            requirement_lower = requirement.lower()
+            for negative_pattern, _ in negative_patterns:
+                if negative_pattern in requirement_lower:
+                    # 提取否定关键词（去除否定词后的内容）
+                    negative_content = requirement_lower.replace(negative_pattern, '').strip()
+                    if negative_content:
+                        # 拆分为单个关键词
+                        keywords = negative_content.split()
+                        for keyword in keywords:
+                            if len(keyword) > 1:  # 过滤掉单字符
+                                negative_keywords.append(keyword)
+        
+        # 预定义的常见否定关键词映射
+        negative_mapping = {
+            '吵闹': ['噪音', '吵', '嘈杂', '喧哗'],
+            '高架': ['高架桥', '立交桥', '高架路'],
+            '工厂': ['化工厂', '污染', '废气', '工业区'],
+            '墓地': ['坟场', '陵园', '公墓'],
+            '老旧': ['破旧', '陈旧', '年代久远'],
+            '偏远': ['偏僻', '交通不便', '远郊'],
+        }
+        
+        # 扩展否定关键词
+        expanded_keywords = []
+        for keyword in negative_keywords:
+            expanded_keywords.append(keyword)
+            for key, synonyms in negative_mapping.items():
+                if keyword in key or key in keyword:
+                    expanded_keywords.extend(synonyms)
+        
+        # 去重并返回
+        return list(set(expanded_keywords)) if expanded_keywords else negative_keywords
+    
+    def _calculate_location_similarity(self, keyword: str, location_text: str) -> float:
+        """
+        计算位置关键词与地址文本的相似度
+        使用多种匹配策略：子字符串、编辑距离等
+        """
+        if not keyword or not location_text:
+            return 0.0
+        
+        # 1. 部分匹配检查
+        if keyword in location_text:
+            return 1.0
+        
+        # 2. 分割地址，逐个部分检查
+        location_parts = location_text.replace('市', '').replace('区', '').replace('县', '').split()
+        
+        for part in location_parts:
+            if len(part) < 2:  # 跳过过短的部分
+                continue
+                
+            # 检查部分匹配
+            if keyword in part or part in keyword:
+                return 0.9
+            
+            # 使用简化的编辑距离计算相似度
+            similarity = self._simple_string_similarity(keyword, part)
+            if similarity > 0.7:
+                return similarity
+        
+        # 3. 常见地名缩写和别名处理
+        location_aliases = {
+            '浦东': ['pudong', '浦东新区'],
+            '徐汇': ['xuhui', '徐家汇'],
+            '静安': ['jingan', '静安区'],
+            '黄浦': ['huangpu', '黄浦区'],
+            '虹口': ['hongkou', '虹口区'],
+            '杨浦': ['yangpu', '杨浦区'],
+            '闵行': ['minhang', '闵行区'],
+            '宝山': ['baoshan', '宝山区'],
+            '嘉定': ['jiading', '嘉定区'],
+            '松江': ['songjiang', '松江区'],
+            '市中心': ['中心', '市区', '内环'],
+            '郊区': ['远郊', '外环'],
+        }
+        
+        for canonical, aliases in location_aliases.items():
+            if keyword == canonical:
+                for alias in aliases:
+                    if alias in location_text:
+                        return 0.8
+            elif keyword in aliases and canonical in location_text:
+                return 0.8
+        
+        return 0.0
+    
+    def _simple_string_similarity(self, s1: str, s2: str) -> float:
+        """
+        简单的字符串相似度计算
+        基于最长公共子序列的比例
+        """
+        if not s1 or not s2:
+            return 0.0
+        
+        # 长度差异过大时直接返回低相似度
+        len_ratio = min(len(s1), len(s2)) / max(len(s1), len(s2))
+        if len_ratio < 0.5:
+            return 0.0
+        
+        # 计算公共字符数
+        common_chars = 0
+        s2_chars = list(s2)
+        
+        for char in s1:
+            if char in s2_chars:
+                s2_chars.remove(char)
+                common_chars += 1
+        
+        # 相似度 = 公共字符数 / 平均长度
+        avg_length = (len(s1) + len(s2)) / 2
+        similarity = common_chars / avg_length if avg_length > 0 else 0.0
+        
+        return min(similarity, 1.0)
     
     def _format_docs_enhanced(self, docs: List[Document], search_params: Dict[str, Any]) -> str:
         """增强的文档格式化"""
