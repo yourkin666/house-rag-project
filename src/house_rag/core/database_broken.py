@@ -1,5 +1,5 @@
 """
-数据库连接和操作模块
+数据库连接和操作模块（优化版）
 """
 import logging
 from typing import List, Tuple, Optional
@@ -19,17 +19,26 @@ class DatabaseManager:
         self._connect()
     
     def _connect(self) -> None:
-        """建立数据库连接"""
+        """建立数据库连接（优化连接池参数）"""
         try:
             self.engine = create_engine(
                 config.database_url,
-                pool_size=15,
-                max_overflow=25,
-                pool_pre_ping=True,
-                echo=config.DEBUG
+                # 连接池优化参数
+                pool_size=15,           # 增加核心连接数（原10->15）
+                max_overflow=25,        # 增加溢出连接数（原20->25） 
+                pool_pre_ping=True,     # 连接前验证（防止连接断开）
+                pool_recycle=3600,      # 连接回收时间：1小时（防止长时间连接失效）
+                pool_timeout=30,        # 获取连接超时：30秒
+                echo=config.DEBUG,
+                # PostgreSQL特定优化
+                connect_args={
+                    "connect_timeout": 10,           # 连接超时：10秒  
+                    "command_timeout": 60,           # 命令超时：60秒
+                    "server_side_cursors": True      # 服务端游标（大结果集优化）
+                }
             )
             logger.info(f"成功连接到数据库: {config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}")
-            logger.info("连接池配置 - 核心连接: 15, 最大连接: 40")
+            logger.info(f"连接池配置 - 核心连接: 15, 最大连接: 40, 回收间隔: 3600秒")
         except Exception as e:
             logger.error(f"数据库连接失败: {e}")
             raise

@@ -23,13 +23,12 @@ class DatabaseManager:
         try:
             self.engine = create_engine(
                 config.database_url,
-                pool_size=15,
-                max_overflow=25,
+                pool_size=10,
+                max_overflow=20,
                 pool_pre_ping=True,
                 echo=config.DEBUG
             )
             logger.info(f"成功连接到数据库: {config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}")
-            logger.info("连接池配置 - 核心连接: 15, 最大连接: 40")
         except Exception as e:
             logger.error(f"数据库连接失败: {e}")
             raise

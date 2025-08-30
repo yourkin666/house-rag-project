@@ -124,6 +124,7 @@ class RAGService:
         self.vector_store = None
         self.rag_chain = None
         self._query_cache = {}  # 简单的查询缓存
+        self._max_cache_size = 100  # 缓存大小限制
         
         # 成本控制和统计
         self._intent_cache = {}  # 意图分析缓存
@@ -135,8 +136,17 @@ class RAGService:
             'last_reset_time': None
         }
         
-        # 混合搜索相关组件
-        self.rrf_fusion = ReciprocalRankFusion(k=60)
+        # 查询统计
+        self._query_stats = {
+            'total_queries': 0,
+            'cache_hit_queries': 0,
+            'avg_results_per_query': 0,
+            'total_results_returned': 0,
+            'last_stats_log': None
+        }
+        
+        # 混合搜索相关组件 - 优化RRF参数
+        self.rrf_fusion = ReciprocalRankFusion(k=40)  # 从60调整到40，增强高排名差异
         self.hybrid_search_enabled = True  # 控制是否启用混合搜索
         self.hybrid_search_stats = {
             'total_hybrid_searches': 0,
@@ -552,6 +562,16 @@ class RAGService:
         
         return final_k
     
+    def _add_to_cache(self, cache_dict: dict, key: str, value: any) -> None:
+        """简单的缓存管理，防止内存泄漏"""
+        if len(cache_dict) >= self._max_cache_size:
+            # 简单粗暴：删除一半旧缓存，避免复杂的LRU实现
+            keys_to_delete = list(cache_dict.keys())[:self._max_cache_size//2]
+            for k in keys_to_delete:
+                del cache_dict[k]
+            logger.info(f"缓存已清理，删除了{len(keys_to_delete)}个旧条目")
+        cache_dict[key] = value
+    
     def _get_adaptive_retriever_config(self, question: str, dynamic_k: int) -> dict:
         """根据查询类型返回最佳的检索器配置（成本优化版）"""
         
@@ -575,7 +595,7 @@ class RAGService:
                 
                 # 缓存结果
                 if config.ENABLE_INTENT_CACHE:
-                    self._intent_cache[cache_key] = intents
+                    self._add_to_cache(self._intent_cache, cache_key, intents)
                 
                 return self._build_strategy_from_intents(intents, dynamic_k)
                 
@@ -644,22 +664,101 @@ class RAGService:
             self._llm_call_stats['last_reset_time'] = now
             logger.info("重置LLM小时调用计数器")
     
+    def _update_cost_stats(self, llm_calls: int, results_count: int) -> None:
+        """更新成本和查询统计"""
+        self._query_stats['total_queries'] += 1
+        self._query_stats['total_results_returned'] += results_count
+        
+        if self._query_stats['total_queries'] > 0:
+            self._query_stats['avg_results_per_query'] = (
+                self._query_stats['total_results_returned'] / self._query_stats['total_queries']
+            )
+        
+        # 每10次查询记录一次统计日志
+        if self._query_stats['total_queries'] % 10 == 0:
+            self._log_performance_stats()
+    
+    def _log_performance_stats(self) -> None:
+        """记录性能统计日志"""
+        import datetime
+        
+        now = datetime.datetime.now()
+        query_stats = self._query_stats
+        llm_stats = self._llm_call_stats
+        
+        cache_hit_rate = (query_stats['cache_hit_queries'] / max(1, query_stats['total_queries'])) * 100
+        llm_hit_rate = (llm_stats['cache_hits'] / max(1, llm_stats['total_calls'])) * 100
+        
+        logger.info(f"""
+📊 性能统计报告 ({now.strftime('%H:%M:%S')})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 查询统计:
+   • 总查询数: {query_stats['total_queries']}
+   • 缓存命中: {query_stats['cache_hit_queries']} ({cache_hit_rate:.1f}%)
+   • 平均结果数: {query_stats['avg_results_per_query']:.1f}
+   
+💰 成本统计:
+   • LLM总调用: {llm_stats['total_calls']}
+   • 意图缓存命中: {llm_stats['cache_hits']} ({llm_hit_rate:.1f}%)
+   • 关键词回退: {llm_stats['keyword_fallbacks']}
+   • 本小时调用: {llm_stats['hourly_calls']}/{config.MAX_LLM_CALLS_PER_HOUR}
+   
+🗄️ 缓存状态:
+   • 查询缓存: {len(self._query_cache)}/{self._max_cache_size}
+   • 意图缓存: {len(self._intent_cache)}/{self._max_cache_size}
+   
+🔧 混合搜索:
+   • 总搜索: {self.hybrid_search_stats['total_hybrid_searches']}
+   • 向量回退: {self.hybrid_search_stats['vector_only_fallbacks']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
+        
+        self._query_stats['last_stats_log'] = now
+    
     def get_cost_stats(self) -> dict:
-        """获取成本统计信息"""
-        stats = self._llm_call_stats.copy()
-        stats['cache_size'] = len(self._intent_cache)
-        stats['cache_hit_rate'] = (
-            stats['cache_hits'] / max(1, stats['total_calls']) * 100
-        )
-        return stats
+        """获取成本统计信息（增强版）"""
+        llm_stats = self._llm_call_stats.copy()
+        query_stats = self._query_stats.copy()
+        
+        # 计算效率指标
+        cache_hit_rate = (query_stats['cache_hit_queries'] / max(1, query_stats['total_queries'])) * 100
+        llm_cache_hit_rate = (llm_stats['cache_hits'] / max(1, llm_stats['total_calls'])) * 100
+        
+        return {
+            # LLM成本统计
+            'llm_total_calls': llm_stats['total_calls'],
+            'llm_cache_hits': llm_stats['cache_hits'],
+            'llm_cache_hit_rate': round(llm_cache_hit_rate, 1),
+            'llm_hourly_calls': llm_stats['hourly_calls'],
+            'llm_hourly_limit': config.MAX_LLM_CALLS_PER_HOUR,
+            'keyword_fallbacks': llm_stats['keyword_fallbacks'],
+            
+            # 查询统计
+            'total_queries': query_stats['total_queries'],
+            'cache_hit_queries': query_stats['cache_hit_queries'],
+            'query_cache_hit_rate': round(cache_hit_rate, 1),
+            'avg_results_per_query': round(query_stats['avg_results_per_query'], 1),
+            
+            # 缓存状态
+            'query_cache_size': len(self._query_cache),
+            'intent_cache_size': len(self._intent_cache),
+            'max_cache_size': self._max_cache_size,
+            
+            # 混合搜索统计
+            'hybrid_searches': self.hybrid_search_stats['total_hybrid_searches'],
+            'vector_fallbacks': self.hybrid_search_stats['vector_only_fallbacks'],
+            'fulltext_contributions': self.hybrid_search_stats['fulltext_contributions'],
+            
+            # 成本效率指标
+            'cost_efficiency': round((100 - llm_cache_hit_rate) / 2, 1),  # 简单的成本效率评分
+        }
     
     def log_cost_summary(self):
-        """记录成本使用摘要"""
+        """记录成本使用摘要（优化版）"""
         stats = self.get_cost_stats()
-        logger.info(f"LLM使用统计 - 总调用: {stats['total_calls']}, "
-                   f"缓存命中率: {stats['cache_hit_rate']:.1f}%, "
-                   f"本小时调用: {stats['hourly_calls']}, "
-                   f"关键词回退: {stats['keyword_fallbacks']}")
+        logger.info(f"💰 成本统计摘要 - LLM总调用: {stats['llm_total_calls']}, "
+                   f"缓存命中率: {stats['llm_cache_hit_rate']}%, "
+                   f"查询缓存率: {stats['query_cache_hit_rate']}%, "
+                   f"成本效率: {stats['cost_efficiency']}/100")
     
     def _classify_intent_with_llm(self, question: str) -> dict:
         """使用LLM进行智能意图分类"""
@@ -942,9 +1041,9 @@ class RAGService:
         }
     
     def _create_rag_chain(self) -> None:
-        """创建RAG处理链"""
+        """创建RAG处理链 - 优化版，避免重复参数提取"""
         # 定义提示模板
-        prompt_template = ChatPromptTemplate.from_template("""
+        self.prompt_template = ChatPromptTemplate.from_template("""
 你是一位顶级的房产销售专家，你的最终目标是说服客户并成功将房子卖给他。请根据以下房源信息回答用户的问题。
 
 房源信息：
@@ -963,18 +1062,27 @@ class RAGService:
 请开始你的回答吧！
 """)
         
-        # 智能检索函数
-        def smart_retrieve(question: str):
-            return self._smart_retrieval(question)
-        
-        # 创建RAG链
-        self.rag_chain = (
-            {"context": smart_retrieve, "question": RunnablePassthrough(), 
-             "query_analysis": lambda x: self._clean_params_for_processing(self._extract_search_parameters(x))}
-            | prompt_template
-            | self.llm
-            | StrOutputParser()
-        )
+        # 注意：新版本不创建自动的RAG链，由query_properties直接调用以避免重复处理
+        logger.info("RAG链模板已创建（优化版）")
+    
+    def _generate_answer_direct(self, context: str, question: str, query_analysis: str) -> str:
+        """直接生成回答，避免重复处理"""
+        try:
+            # 构建输入
+            prompt_input = {
+                "context": context,
+                "question": question,
+                "query_analysis": query_analysis
+            }
+            
+            # 直接调用LLM
+            chain = self.prompt_template | self.llm | StrOutputParser()
+            answer = chain.invoke(prompt_input)
+            
+            return answer
+        except Exception as e:
+            logger.error(f"生成回答失败: {e}")
+            return "抱歉，生成回答时出现问题，请稍后重试。"
     
     def _hybrid_search_and_rerank(self, question: str, search_params: Dict[str, Any], dynamic_k: int) -> List[Document]:
         """
@@ -1176,16 +1284,11 @@ class RAGService:
             # 6. 格式化结果
             formatted_context = self._format_docs_enhanced(filtered_docs, search_params)
             
-            # 7. 缓存结果（限制缓存大小）
-            if len(self._query_cache) > 100:
-                # 简单的LRU清理：删除最旧的条目
-                oldest_key = next(iter(self._query_cache))
-                del self._query_cache[oldest_key]
-            
-            self._query_cache[cache_key] = {
+            # 7. 缓存结果（使用缓存管理）
+            self._add_to_cache(self._query_cache, cache_key, {
                 'formatted_context': formatted_context,
                 'search_params': search_params
-            }
+            })
             
             return formatted_context
             
@@ -1538,11 +1641,26 @@ class RAGService:
     
     def query_properties(self, question: str, max_results: int = 5) -> Dict[str, Any]:
         """
-        智能查询房源并生成回答
+        智能查询房源并生成回答（优化版 - 避免重复LLM调用）
         返回: {'answer': str, 'retrieved_properties': List[Dict], 'query_analysis': Dict, 'search_quality': Dict}
         """
         try:
-            # 提取查询参数（包含元数据用于分析）
+            # 1. 先检查完整缓存
+            cache_key = hash(f"{question}_{max_results}")  # 包含max_results避免缓存问题
+            if cache_key in self._query_cache:
+                logger.info("使用完整缓存结果，节省所有成本")
+                # 更新缓存统计
+                self._query_stats['cache_hit_queries'] += 1
+                self._update_cost_stats(0, len(self._query_cache[cache_key].get('retrieved_properties', [])))
+                
+                cached_result = self._query_cache[cache_key]
+                # 只返回需要的数量
+                if len(cached_result.get('retrieved_properties', [])) > max_results:
+                    cached_result = cached_result.copy()
+                    cached_result['retrieved_properties'] = cached_result['retrieved_properties'][:max_results]
+                return cached_result
+            
+            # 2. 只提取一次参数（避免重复LLM调用）
             raw_search_params = self._extract_search_parameters(question)
             search_params = self._clean_params_for_processing(raw_search_params)
             extraction_metadata = raw_search_params.get('_extraction_metadata', {})
@@ -1551,40 +1669,35 @@ class RAGService:
             if extraction_metadata:
                 logger.info(f"参数提取详情: {extraction_metadata}")
             
-            # 获取RAG回答
-            answer = self.rag_chain.invoke(question)
-            
-            # 获取检索结果用于详细分析
-            cache_key = hash(question)
-            if cache_key in self._query_cache:
-                cached_data = self._query_cache[cache_key]
-                # 注意：缓存中的search_params可能是旧格式，保持兼容
-                cached_search_params = cached_data.get('search_params', {})
-                if '_extraction_metadata' not in cached_search_params:
-                    # 如果缓存的是清理后的参数，直接使用
-                    search_params = cached_search_params
-            
-            # 重新检索以获取详细信息
+            # 3. 获取检索结果
             dynamic_k = self._calculate_dynamic_k(search_params, question)
-            retriever = self.vector_store.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={
-                    "k": dynamic_k,
-                    "score_threshold": 0.6  # 稍微放宽阈值
-                }
-            )
             
-            retrieved_docs = retriever.invoke(question)
-            filtered_docs = self._rerank_and_filter(retrieved_docs, search_params)
+            # 使用混合搜索或向量搜索
+            if self.hybrid_search_enabled:
+                filtered_docs = self._hybrid_search_and_rerank(question, search_params, dynamic_k)
+            else:
+                retriever = self.vector_store.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs={
+                        "k": dynamic_k,
+                        "score_threshold": 0.6
+                    }
+                )
+                retrieved_docs = retriever.invoke(question)
+                filtered_docs = self._rerank_and_filter(retrieved_docs, search_params)
             
-            # 格式化检索到的房源信息
+            # 4. 生成上下文
+            context = self._format_docs_enhanced(filtered_docs[:max_results], search_params)
+            
+            # 5. 只调用一次LLM生成回答
+            answer = self._generate_answer_direct(context, question, str(search_params))
+            
+            # 6. 格式化检索到的房源信息
             retrieved_properties = []
             total_score = 0
             
             for doc in filtered_docs[:max_results]:
                 metadata = doc.metadata
-                
-                # 计算匹配分数
                 match_score = self._calculate_match_score(doc, search_params)
                 total_score += match_score
                 
@@ -1599,32 +1712,72 @@ class RAGService:
                 }
                 retrieved_properties.append(property_info)
             
-            # 搜索质量分析
+            # 7. 搜索质量分析
             avg_score = total_score / len(retrieved_properties) if retrieved_properties else 0
             search_quality = {
-                "total_found": len(retrieved_docs),
+                "total_found": len(filtered_docs),
                 "returned_count": len(retrieved_properties),
                 "average_match_score": round(avg_score, 3),
                 "search_quality_level": self._get_search_quality_level(avg_score),
-                "used_cache": cache_key in self._query_cache,
-                "dynamic_k_used": dynamic_k
+                "used_cache": False,  # 这次没有使用缓存
+                "dynamic_k_used": dynamic_k,
+                "extraction_method": extraction_metadata.get('method', 'unknown')
             }
             
-            return {
+            # 8. 构建最终结果
+            result = {
                 "answer": answer,
                 "retrieved_properties": retrieved_properties,
                 "query_analysis": search_params,
                 "search_quality": search_quality
             }
             
+            # 9. 缓存完整结果（使用缓存管理）
+            self._add_to_cache(self._query_cache, cache_key, result)
+            
+            # 10. 记录成本统计
+            llm_calls = int(extraction_metadata.get('used_llm_fallback', False)) + 1
+            self._update_cost_stats(llm_calls, len(retrieved_properties))
+            logger.info(f"查询完成，结果已缓存。LLM调用次数: {llm_calls}")
+            
+            return result
+            
         except Exception as e:
             logger.error(f"查询房源失败: {e}")
-            # 返回错误但不抛出异常，提供降级服务
+            # 提供简单的降级服务
+            return self._simple_fallback_response(question, max_results)
+    
+    def _simple_fallback_response(self, question: str, max_results: int) -> Dict[str, Any]:
+        """简单的降级响应，避免完全失败"""
+        try:
+            # 最简单的向量搜索
+            docs = self.vector_store.similarity_search(question, k=max_results)
+            simple_answer = "抱歉，系统暂时不稳定。以下是为您找到的相关房源："
+            
+            properties = []
+            for doc in docs:
+                properties.append({
+                    "id": doc.metadata.get('property_id'),
+                    "title": doc.metadata.get('title'),
+                    "location": doc.metadata.get('location'),
+                    "price": doc.metadata.get('price'),
+                    "match_score": 0.5,
+                    "match_percentage": 50,
+                    "match_reasons": ["基础匹配"]
+                })
+            
             return {
-                "answer": "抱歉，搜索服务暂时不可用，请稍后重试。",
+                "answer": simple_answer,
+                "retrieved_properties": properties,
+                "query_analysis": {},
+                "search_quality": {"error_fallback": True}
+            }
+        except Exception:
+            return {
+                "answer": "系统暂时维护中，请稍后再试。",
                 "retrieved_properties": [],
                 "query_analysis": {},
-                "search_quality": {"error": str(e)}
+                "search_quality": {"error": "complete_failure"}
             }
     
     def _calculate_match_score(self, doc: Document, search_params: Dict[str, Any]) -> float:

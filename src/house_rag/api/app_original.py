@@ -13,7 +13,6 @@ from .models import (
 from ..core.config import config
 from ..core.database import db_manager
 from ..core.embeddings import rag_service
-from ..core.embeddings_async import async_rag_service
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -57,27 +56,18 @@ async def startup_event():
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     """
-    智能房源查询接口（支持异步优化）
+    智能房源查询接口
     
     接收用户的自然语言问题，通过RAG技术返回相关的房源推荐和详细回答
-    优先使用异步优化版本以提升性能
     """
     try:
         logger.info(f"收到问题查询: {request.question}")
         
-        # 优先使用异步优化版本
-        try:
-            logger.info("使用异步优化RAG服务")
-            result = async_rag_service.query_properties_async(
-                question=request.question,
-                max_results=request.max_results
-            )
-        except Exception as async_error:
-            logger.warning(f"异步查询失败，回退到同步版本: {async_error}")
-            result = rag_service.query_properties(
-                question=request.question,
-                max_results=request.max_results
-            )
+        # 调用RAG服务进行查询
+        result = rag_service.query_properties(
+            question=request.question,
+            max_results=request.max_results
+        )
         
         logger.info("问题查询完成")
         return QuestionResponse(
@@ -140,34 +130,6 @@ async def add_property(request: PropertyRequest):
         raise HTTPException(status_code=500, detail=f"添加房源失败: {str(e)}")
 
 
-
-
-@app.get("/stats")
-async def get_performance_stats():
-    """
-    获取系统性能统计信息
-    """
-    try:
-        stats = {
-            "sync_rag_stats": rag_service.get_cost_stats(),
-            "async_rag_available": True,
-            "database_connections": "15 core, 40 max",
-            "optimization_version": "v2.0-async"
-        }
-        
-        # 尝试获取异步RAG统计
-        try:
-            async_stats = async_rag_service.get_cost_stats()
-            async_stats["async_optimized"] = True
-            stats["async_rag_stats"] = async_stats
-        except Exception:
-            stats["async_rag_available"] = False
-        
-        return stats
-        
-    except Exception as e:
-        logger.error(f"获取统计失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取统计失败: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
